@@ -137,3 +137,5 @@ npm run lint    # 代码检查
 ## 备注
 
 `NEXT_PUBLIC_*` 变量会打包进浏览器代码、完全公开。不要把 Supabase `service_role`、后台管理密钥、第三方 API 私钥写进任何 `NEXT_PUBLIC_*` 变量。
+
+> 提示：自部署遇到问题时，可先检查环境变量是否配置正确，并确认所用分支（main / test）与设备匹配。
