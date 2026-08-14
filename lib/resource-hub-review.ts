@@ -157,9 +157,28 @@ export async function setAutoApprove(enabled: boolean): Promise<void> {
 }
 
 /** 通过并上架（合并 PR），并强刷索引的 CDN 缓存让新资源尽快可见。 */
+/**
+ * 审完顺手删掉 PR 的头分支（submit/claim 这类机器人开的临时分支）。
+ * GitHub 的"自动删分支"只覆盖合并的 PR，关闭的不管；这里统一兜底。
+ * 尽力而为：分支已删/权限不够都不影响审核结果本身。
+ */
+async function deletePrHeadBranch(prNumber: number): Promise<void> {
+    try {
+        const { token, owner, repo } = getReviewAuth();
+        const pr = await gh<{ head?: { ref?: string; repo?: { full_name?: string } } }>(
+            token, "GET", `/repos/${owner}/${repo}/pulls/${prNumber}`);
+        const ref = pr.head?.ref || "";
+        // 只删本仓库内、机器人临时分支形态的头分支；跨仓 PR / main 一律不碰
+        if (pr.head?.repo?.full_name !== `${owner}/${repo}`) return;
+        if (!/^(submit|claim)\//.test(ref)) return;
+        await gh(token, "DELETE", `/repos/${owner}/${repo}/git/refs/heads/${ref.split("/").map(encodeURIComponent).join("/")}`);
+    } catch { /* 尽力而为 */ }
+}
+
 export async function approveShareSubmission(prNumber: number): Promise<void> {
     const { token, owner, repo } = getReviewAuth();
     await gh(token, "PUT", `/repos/${owner}/${repo}/pulls/${prNumber}/merge`, { merge_method: "merge" });
+    await deletePrHeadBranch(prNumber);
     // 索引由资源仓库的 Actions 在合并后重建（约 1 分钟），这里先把 CDN 缓存清掉
     setTimeout(() => purgeShareIndexCache(loadResourceHubSource()), 90_000);
     purgeShareIndexCache(loadResourceHubSource());
@@ -204,4 +223,98 @@ export async function rejectShareSubmission(prNumber: number, reason?: string): 
         await gh(token, "POST", `/repos/${owner}/${repo}/issues/${prNumber}/comments`, { body: `审核未通过：${trimmed}` });
     }
     await gh(token, "PATCH", `/repos/${owner}/${repo}/pulls/${prNumber}`, { state: "closed" });
+    await deletePrHeadBranch(prNumber);
+}
+
+// ── 找回作品申请（特殊 PR：分支上只有证明材料，审核=改写 .owner，绝不合并）──
+
+export const SHARE_CLAIM_TITLE_PREFIX = "【找回申请】";
+
+export type ShareClaimInfo = {
+    entryPath: string;
+    ownerHash: string;
+    nickname: string;
+    /** 证明材料在私有保管库里的编号与仓库（早期申请可能没有） */
+    claimId?: string;
+    vaultRepo?: string;
+};
+
+/** 从投稿列表里识别找回申请并解析元数据；不是找回申请返回 null */
+export function parseShareClaim(submission: ShareSubmission): ShareClaimInfo | null {
+    if (!submission.title.startsWith(SHARE_CLAIM_TITLE_PREFIX)) return null;
+    // 资源标题里常有空格，必须取整行（\S+ 会在第一个空格截断，曾写错过路径）
+    const entryPath = submission.body.match(/^资源路径[:：]\s*(.+?)\s*$/m)?.[1];
+    const ownerHash = submission.body.match(/^新钥匙指纹[:：]\s*([0-9a-f]{64})/m)?.[1];
+    const nickname = submission.body.match(/^申请人[:：]\s*(.+)$/m)?.[1]?.trim() || "匿名";
+    const claimId = submission.body.match(/^申请编号[:：]\s*(\S+)/m)?.[1];
+    const vaultRepo = submission.body.match(/^证明仓库[:：]\s*([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/m)?.[1];
+    return entryPath && ownerHash ? { entryPath, ownerHash, nickname, claimId, vaultRepo } : null;
+}
+
+/**
+ * 读取找回申请的证明材料：存在私有保管库里，只有管理员的 token 打得开。
+ * 早期申请（证明直接放在 PR 分支上）没有保管库信息，回落到读 PR 文件。
+ */
+export async function fetchClaimProofFiles(prNumber: number, claim: ShareClaimInfo): Promise<ShareSubmissionFile[]> {
+    if (!claim.claimId || !claim.vaultRepo) return fetchShareSubmissionFiles(prNumber);
+    const { token } = getReviewAuth();
+    const [vaultOwner, vaultRepo] = claim.vaultRepo.split("/");
+    const encode = (p: string) => p.split("/").map(encodeURIComponent).join("/");
+    const dir = `找回申请/${claim.claimId}`;
+    const listing = await gh<Array<{ path: string; name: string; size: number; type: string }>>(
+        token, "GET", `/repos/${vaultOwner}/${vaultRepo}/contents/${encode(dir)}`);
+    const result: ShareSubmissionFile[] = [];
+    for (const item of listing.filter(f => f.type === "file")) {
+        const entry: ShareSubmissionFile = { path: item.name, size: item.size };
+        try {
+            const blob = await gh<{ content?: string; encoding?: string }>(
+                token, "GET", `/repos/${vaultOwner}/${vaultRepo}/contents/${encode(item.path)}`);
+            if (blob.encoding === "base64" && blob.content) {
+                if (IMAGE_EXT_RE.test(item.name)) {
+                    const ext = item.name.split(".").pop()!.toLowerCase().replace("jpg", "jpeg");
+                    entry.imageDataUrl = `data:image/${ext};base64,${blob.content.replace(/\s/g, "")}`;
+                } else {
+                    const text = decodeBase64Utf8(blob.content);
+                    entry.textPreview = text.slice(0, TEXT_PREVIEW_MAX) + (text.length > TEXT_PREVIEW_MAX ? "\n…（已截断）" : "");
+                }
+            } else {
+                entry.note = `文件较大（${Math.round(item.size / 1024)}KB），请到保管库仓库查看`;
+            }
+        } catch {
+            entry.note = "内容预览失败";
+        }
+        result.push(entry);
+    }
+    return result;
+}
+
+/**
+ * 通过找回：用管理员 token 把该资源的 .owner 改写成申请人的钥匙指纹，
+ * 然后关闭申请 PR（证明材料永不进入 main）。索引重建后申请人设备自动认领回资源。
+ */
+export async function approveShareClaim(prNumber: number, claim: ShareClaimInfo): Promise<void> {
+    const { token, owner, repo } = getReviewAuth();
+    const encode = (p: string) => p.split("/").map(encodeURIComponent).join("/");
+    const ownerFile = `${claim.entryPath}/.owner`;
+    let sha: string | undefined;
+    try {
+        const info = await gh<{ sha?: string }>(token, "GET", `/repos/${owner}/${repo}/contents/${encode(ownerFile)}`);
+        sha = info.sha;
+    } catch { /* 老资源可能没有 .owner，直接新建 */ }
+    await gh(token, "PUT", `/repos/${owner}/${repo}/contents/${encode(ownerFile)}`, {
+        message: `找回作品：${claim.entryPath} 所有权重绑（申请 #${prNumber}）`,
+        content: btoa(claim.ownerHash),
+        ...(sha ? { sha } : {}),
+    });
+    // 留言只是善意通知，token 缺 Issues 权限时不能拖垮整个通过流程
+    try {
+        await gh(token, "POST", `/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
+            body: "✅ 找回申请已通过，作品所有权已绑定到申请人的摊主钥匙。索引重建后（约 1 分钟）在原设备打开资源集市即可恢复管理权限。",
+        });
+    } catch { /* 尽力而为 */ }
+    await gh(token, "PATCH", `/repos/${owner}/${repo}/pulls/${prNumber}`, { state: "closed" });
+    await deletePrHeadBranch(prNumber);
+    // 索引由 Actions 在 .owner 提交后重建，先清一次 CDN 缓存，稍后再清一次兜底
+    setTimeout(() => purgeShareIndexCache(loadResourceHubSource()), 90_000);
+    purgeShareIndexCache(loadResourceHubSource());
 }

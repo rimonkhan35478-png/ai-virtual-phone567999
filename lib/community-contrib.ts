@@ -51,26 +51,30 @@ export type ContribCompareResult = {
     files: ContribChangedFile[];
 };
 
-async function ghPublic(path: string): Promise<Record<string, unknown>> {
+async function ghPublic(path: string, token?: string): Promise<Record<string, unknown>> {
     const res = await fetch(`https://api.github.com${path}`, {
-        headers: { Accept: "application/vnd.github+json" },
+        headers: {
+            Accept: "application/vnd.github+json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
     });
     if (!res.ok) {
         if (res.status === 403) throw new Error("GitHub 接口触发临时频率限制，请一小时后再试");
-        if (res.status === 404) throw new Error("仓库或分支不存在（fork 地址对吗？仓库是公开的吗？）");
+        if (res.status === 404) throw new Error("仓库或分支不存在（fork 地址对吗？私有 fork 需先在工坊「连接仓库」里连接它）");
         throw new Error(`GitHub 接口错误 ${res.status}`);
     }
     return await res.json() as Record<string, unknown>;
 }
 
 /** fork 与官方 main 的差异（GitHub compare API，按合并基准算，天然处理 fork 落后的情况）。
- *  branch 缺省用 fork 的默认分支；改动在别的分支上时可指定。 */
-export async function compareForkWithUpstream(forkRepo: string, branch?: string): Promise<ContribCompareResult> {
-    const forkInfo = await ghPublic(`/repos/${forkRepo}`);
+ *  branch 缺省用 fork 的默认分支；私有 fork 传 token（能读该 fork 即可）。 */
+export async function compareForkWithUpstream(forkRepo: string, branch?: string, token?: string): Promise<ContribCompareResult> {
+    const forkInfo = await ghPublic(`/repos/${forkRepo}`, token);
     const forkBranch = String(branch || "").trim() || String(forkInfo.default_branch || "main");
     const forkOwner = forkRepo.split("/")[0];
     const compare = await ghPublic(
         `/repos/${UPSTREAM_REPO}/compare/main...${encodeURIComponent(forkOwner)}:${encodeURIComponent(forkBranch)}`,
+        token,
     );
     const rawFiles = Array.isArray(compare.files) ? compare.files as Array<Record<string, unknown>> : [];
     return {
@@ -92,9 +96,15 @@ export async function compareForkWithUpstream(forkRepo: string, branch?: string)
     };
 }
 
-/** 读 fork 里某个文件的当前内容（raw 域名带 CORS，浏览器可直连） */
-export async function fetchForkFileText(forkRepo: string, branch: string, path: string): Promise<string> {
-    const res = await fetch(`https://raw.githubusercontent.com/${forkRepo}/${encodeURIComponent(branch)}/${path.split("/").map(encodeURIComponent).join("/")}`);
+/** 读 fork 里某个文件的当前内容。公开 fork 走 raw 域名（带 CORS 可直连）；
+ *  私有 fork 带 token 走 contents API 的 raw 媒体类型（api 域名对带鉴权的跨域请求友好）。 */
+export async function fetchForkFileText(forkRepo: string, branch: string, path: string, token?: string): Promise<string> {
+    const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+    const res = token
+        ? await fetch(`https://api.github.com/repos/${forkRepo}/contents/${encodedPath}?ref=${encodeURIComponent(branch)}`, {
+            headers: { Accept: "application/vnd.github.raw+json", Authorization: `Bearer ${token}` },
+        })
+        : await fetch(`https://raw.githubusercontent.com/${forkRepo}/${encodeURIComponent(branch)}/${encodedPath}`);
     if (!res.ok) throw new Error(`读取 fork 文件失败 ${res.status}（${path}）`);
     return await res.text();
 }

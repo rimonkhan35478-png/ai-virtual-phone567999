@@ -12,12 +12,15 @@ import { fetchReports, moderationApi, type ContentReport } from "@/lib/moderatio
 import { fetchCustomAppMarketAdminItems, reviewCustomAppMarketItem } from "@/lib/custom-app-market-client";
 import type { CustomAppMarketItem } from "@/lib/custom-app-market-types";
 import {
+  approveShareClaim,
   approveShareSubmission,
   canManageShareRepo,
   fetchAutoApprove,
   setAutoApprove,
+  fetchClaimProofFiles,
   fetchShareSubmissionFiles,
   listShareSubmissions,
+  parseShareClaim,
   rejectShareSubmission,
   type ShareSubmission,
   type ShareSubmissionFile,
@@ -180,7 +183,11 @@ export function ModerationCenter({ onNotice }: { onNotice?: (msg: string) => voi
     if (!shareFiles[item.number]) {
       setShareFiles(current => ({ ...current, [item.number]: "loading" }));
       try {
-        const files = await fetchShareSubmissionFiles(item.number);
+        // 找回申请的证明材料在私有保管库里，走专用读取；普通投稿读 PR 文件
+        const claim = parseShareClaim(item);
+        const files = claim
+          ? await fetchClaimProofFiles(item.number, claim)
+          : await fetchShareSubmissionFiles(item.number);
         setShareFiles(current => ({ ...current, [item.number]: files }));
       } catch (err) {
         notice(err instanceof Error ? err.message : "内容加载失败");
@@ -193,8 +200,15 @@ export function ModerationCenter({ onNotice }: { onNotice?: (msg: string) => voi
     setShareBusy(current => ({ ...current, [item.number]: action }));
     try {
       if (action === "approve") {
-        await approveShareSubmission(item.number);
-        notice(`已上架「${item.title}」（CDN 缓存刷新后集市可见）`);
+        // 找回申请是特殊 PR：通过=改写 .owner 并关闭，绝不合并（证明材料不进仓库）
+        const claim = parseShareClaim(item);
+        if (claim) {
+          await approveShareClaim(item.number, claim);
+          notice(`已通过找回申请，「${claim.entryPath.split("/").pop()}」的所有权已重绑给 ${claim.nickname}`);
+        } else {
+          await approveShareSubmission(item.number);
+          notice(`已上架「${item.title}」（CDN 缓存刷新后集市可见）`);
+        }
       } else {
         await rejectShareSubmission(item.number, reason);
         notice(`已拒绝「${item.title}」`);
@@ -355,7 +369,7 @@ export function ModerationCenter({ onNotice }: { onNotice?: (msg: string) => voi
       {tab === "share" ? (
         <div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-            <span style={subStyle}>资源集市的待审投稿（通过 = 上架；拒绝可留言）</span>
+            <span style={subStyle}>待审投稿（通过=上架）与找回申请（通过=所有权重绑，证明材料在「查看内容」里）</span>
             <button type="button" style={{ ...btnStyle, display: "inline-flex", alignItems: "center", gap: 4 }} onClick={() => void loadShareItems()}><RefreshCw size={12} />刷新</button>
           </div>
           {canManageRepo ? (
@@ -426,8 +440,8 @@ export function ModerationCenter({ onNotice }: { onNotice?: (msg: string) => voi
                     </button>
                     <button type="button" style={btnStyle} disabled={!!shareBusy[item.number]} onClick={() => void runShareAction(item, "approve")}>
                       {shareBusy[item.number] === "approve"
-                        ? <><Loader2 size={12} className="animate-spin" style={{ verticalAlign: -2 }} /> 上架中…</>
-                        : "通过并上架"}
+                        ? <><Loader2 size={12} className="animate-spin" style={{ verticalAlign: -2 }} /> 处理中…</>
+                        : parseShareClaim(item) ? "通过找回" : "通过并上架"}
                     </button>
                     <button type="button" style={dangerBtn} disabled={!!shareBusy[item.number]} onClick={() => setShareRejectFor(item.number)}>拒绝</button>
                   </div>

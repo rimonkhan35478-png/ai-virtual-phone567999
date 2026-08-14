@@ -637,7 +637,7 @@ function QaRepoSheet({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
             <span className="qa-field-label">Fine-grained PAT（私有仓库或搜索代码需要）</span>
             <input className="qa-input" type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="github_pat_…" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
             <span className="qa-field-hint">
-              GitHub → Settings → Menu 按钮 → Developer settings → Personal access tokens → Fine-grained tokens。创建时 Repository access 记得勾选目标仓库；Permissions 只需添加 Contents 一项——只查代码选 Read-only，要让工坊改代码选 Read and write（Metadata 会自动带上，其余权限都不用勾）。
+              GitHub → Settings → Menu 按钮 → Developer settings → Personal access tokens → Fine-grained tokens。创建时 Repository access 记得勾选目标仓库；Permissions 里：Contents——只查代码选 Read-only，要让工坊改代码选 Read and write；要用「创建PR」再加 Pull requests 的 Read and write（Metadata 会自动带上，其余权限都不用勾）。
             </span>
           </label>
           <div className="qa-field">
